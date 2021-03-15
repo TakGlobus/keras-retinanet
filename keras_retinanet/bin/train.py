@@ -356,6 +356,48 @@ def create_generators(args, preprocess_image):
     return train_generator, validation_generator
 
 
+def input_clouds_fn(filelist, height=128, width=128, batch_size=32, 
+                    prefetch=1, read_threads=4,nrepeat=-1, distribute=(1, 0), gray=1):
+    """
+      INPUT:
+        prefetch: tf.int64. How many "minibatch" we asynchronously prepare on CPU ahead of GPU
+        nrepeat: number of repeat dataset
+    """
+
+    def parser(ser):
+        """
+        Decode & Pass datast in tf.record
+        *Cuation*
+        floating point: tfrecord data ==> tf.float64
+        """
+        features = {
+            "shape": tf.io.FixedLenFeature([3], tf.int64),
+            "patch": tf.io.FixedLenFeature([], tf.string),
+            "filename": tf.io.FixedLenFeature([], tf.string),
+            "label": tf.io.FixedLenFeature([], tf.string),
+            "nlabel": tf.io.FixedLenFeature([1], tf.int64),
+        }
+        decoded = tf.io.parse_single_example(ser, features)
+        patch = tf.reshape(
+            tf.io.decode_raw(decoded["patch"], tf.float64), decoded["shape"]
+        )
+        oheight = decoded["shape"][0]
+        patch = tf.cast(patch, tf.float32)
+        patch = tf.image.resize(patch, (height, width)) 
+        # resize here
+        label = decoded['nlabel'][0] # (1)
+
+        patch = tf.image.rgb_to_grayscale(patch)
+        return patch, label
+
+    dataset = tf.data.Dataset.list_files(filelist, shuffle=True
+          ).apply(parallel_interleave(
+              lambda f: tf.data.TFRecordDataset(f).map(parser),
+              cycle_length=read_threads,
+          ))
+    dataset = dataset.shuffle(1000).repeat(nrepeat).batch(int(batch_size),drop_remainder=True).prefetch(prefetch)
+    return dataset
+
 def check_args(parsed_args):
     """ Function to check for inherent contradictions within parsed arguments.
     For example, batch_size < num_gpus
@@ -456,6 +498,11 @@ def parse_args(args):
     parser.add_argument('--workers',          help='Number of generator workers.', type=int, default=1)
     parser.add_argument('--max-queue-size',   help='Queue length for multiprocessing workers in fit_generator.', type=int, default=10)
 
+
+    # custom arguments
+    parser.add_argument('--label_datadir',    help='Directory name of labeled tfrecords', type=str, default='./')
+    parser.add_argument('--unlabel_datadir',  help='Directory name of unlabeled tfrecords', type=str, default='./')
+
     return check_args(parser.parse_args(args))
 
 
@@ -480,7 +527,22 @@ def main(args=None):
         args.config = read_config_file(args.config)
 
     # create the generators
-    train_generator, validation_generator = create_generators(args, backbone.preprocess_image)
+    #train_generator, validation_generator = create_generators(args, backbone.preprocess_image)
+
+
+    # load tfrecords
+    label_filelist = glob.glob(os.path.join(args.label_datadir,"*tfrecord"))
+    unlabel_filelist = glob.glob(os.path.join(args.unlabel_datadir,"*tfrecord"))
+
+    # create tf.Data pipeline for training dataset
+    train_dataset = input_clouds_fn(unlabel_filelist, height=1050, width=700, batch_size=args.batch_size, 
+                                    prefetch=1, read_threads=4,nrepeat=-1, 
+                                    distribute=(1, 0), gray=1):
+
+    # create tf.Data pipeline for validation dataset
+    valid_dataset = input_clouds_fn(label_filelist, height=1050, width=700, batch_size=args.batch_size, 
+                                    prefetch=1, read_threads=4,nrepeat=-1, 
+                                    distribute=(1, 0), gray=1):
 
     # create the model
     if args.snapshot is not None:
@@ -536,7 +598,7 @@ def main(args=None):
 
     # start training
     return training_model.fit_generator(
-        generator=train_generator,
+        generator=train_dataset,
         steps_per_epoch=args.steps,
         epochs=args.epochs,
         verbose=1,
@@ -544,7 +606,7 @@ def main(args=None):
         workers=args.workers,
         use_multiprocessing=args.multiprocessing,
         max_queue_size=args.max_queue_size,
-        validation_data=validation_generator,
+        validation_data=validation_dataset,
         initial_epoch=args.initial_epoch
     )
 
